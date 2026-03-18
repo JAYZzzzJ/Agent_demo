@@ -1,3 +1,4 @@
+import base64
 import os
 import pandas as pd
 import json
@@ -78,42 +79,67 @@ def stitch_images_vertically(image_urls):
 
     return stitched_img
 
-def extract_specs_from_stitched_image(stitched_img, max_retries = 3):
-    if stitched_img is None:
-        return {}
 
-    for attempt in range(max_retries):
-        try:
+def extract_specs_from_stitched_image(stitched_img):
+    """
+    使用 Qwen-VL (通义千问视觉大模型) 替代 Gemini 解析商详图片
+    """
+    if stitched_img is None: return {}
 
-            prompt = """
-            你是一个资深的电气自动化与数据科学工程师。这是一张由多张切片拼接而成的完整产品长图。
-            请仔细分析图中的技术图纸、尺寸标注和参数表格。
-            提取其中所有有价值的技术参数（如电压、孔径、材质、接线方式等）。
-            请务必只输出一个合法的 JSON 格式字典，键为参数名，值为参数内容。不要有任何多余的 Markdown 标记。
-            """
+    # 1. 将拼接好的 PIL Image 转为 Base64 字符串
+    buffered = BytesIO()
+    stitched_img.save(buffered, format="JPEG")
+    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    image_url = f"data:image/jpeg;base64,{img_base64}"
 
-            result = gemini_client.models.generate_content(
-                model='gemini-3-flash-preview',
-                contents=[stitched_img, prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            )
-            return json.loads(result.text)
+    prompt = """
+    你是一个资深的电气自动化与数据科学工程师。这是一张由多张切片拼接而成的完整产品长图。
+    请仔细分析图中的技术图纸、尺寸标注和参数表格。
+    提取其中所有有价值的技术参数（如电压、孔径、材质、接线方式等）。
+    请务必只输出一个合法的 JSON 格式字典，键为参数名，值为参数内容。不要有任何多余的 Markdown 标记。
+    """
 
-        except Exception as e:
-            error_msg = str(e)
-            print(f"Gemini 长图解析失败 (第 {attempt + 1}/{max_retries} 次): {error_msg}")
-            # 【关键修改】：针对 429 额度限制，延长休眠时间到 20 秒以上
-            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                print("触发 API 频率限制，程序将暂停 22 秒后重试...")
-                time.sleep(22)
-            elif "503" in error_msg:
-                print("服务拥挤，等待 5 秒后重试...")
-                time.sleep(5)
+    try:
+        # 调用百炼平台的 Qwen-VL-Max 模型
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"image": image_url},
+                    {"text": prompt}
+                ]
+            }
+        ]
+
+        response = dashscope.MultiModalConversation.call(
+            model='qwen-vl-max',
+            messages=messages,
+            result_format='message'
+        )
+
+        if response.status_code == 200:
+            raw_content = response.output.choices[0]['message']['content']
+
+            # 【核心修复】：处理多模态模型返回的 List 结构
+            result_text = ""
+            if isinstance(raw_content, list):
+                # 遍历 List 提取出文本部分
+                for item in raw_content:
+                    if 'text' in item:
+                        result_text += item['text']
             else:
-                break
-    return {}
+                result_text = str(raw_content)
+
+            print(f"👁️ [Qwen-VL 提取结果]: {result_text[:50]}...")  # 打印前50个字预览
+            return result_text.strip()
+
+        else:
+            print(f"❌ Qwen-VL 视觉解析失败: {response.message}")
+            return ""
+
+    except Exception as e:
+        print(f"图像解析异常: {e}")
+        return {}
 
 # ==========================================
 # 2. 双流 RAG 系统 (Qwen + CLIP)
@@ -153,6 +179,13 @@ class DualStreamAgentSystem:
             product_id = str(row['id'])
             print(f"\n--- 正在处理商品 ID: {product_id} ---")
 
+            # 去重：如果库里有了就不重复跑，省钱省时间
+            # existing = self.text_collection.get(ids=[f"txt_{product_id}"])
+            # if existing['ids']:
+            #     print(f"商品 ID: {product_id} 已在知识库中，跳过。")
+            #     continue
+
+            print(f"\n--- 正在处理商品 ID: {product_id} ---")
             # 流向 A：视觉特征入库
             main_url = row.get('商品主图URL地址', '')
             if pd.notna(main_url) and str(main_url).strip().lower() != 'nan':
@@ -160,7 +193,7 @@ class DualStreamAgentSystem:
                 if main_img:
                     try:
                         img_embedding = self.clip_model.encode(main_img).tolist()
-                        self.image_collection.add(
+                        self.image_collection.upsert(
                             documents=[f"Image of product {product_id}"],
                             embeddings=[img_embedding],
                             metadatas=[{"product_id": product_id, "url": main_url, "name": row['商品完整名称']}],
@@ -171,7 +204,8 @@ class DualStreamAgentSystem:
                         print(f"❌ 主图向量化失败: {e}")
 
             # 流向 B：文本知识入库
-            base_info = f"商品名称：{row['商品完整名称']}，型号：{row['商品型号']}，价格：{row['当前实际销售价格']}元。"
+  #############    基础知识问题待解决       ##############
+            searchable_base_info = f"商品名称：{row['商品完整名称']}，型号：{row['商品型号']}，价格：{row['当前实际销售价格']}元。"
             detail_urls_raw = row.get('商详图片', '')
             # 过滤商详图片的 nan 空值
             if pd.isna(detail_urls_raw) or str(detail_urls_raw).strip().lower() == 'nan':
@@ -184,25 +218,31 @@ class DualStreamAgentSystem:
                 stitched_image = stitch_images_vertically(detail_urls)
 
                 if stitched_image:
-                    print("✅ 商详切片拼接完成，发送至 Gemini 进行参数解析...")
+                    print("✅ 商详切片拼接完成，发送至 LLM 进行参数解析...")
                     image_specs = extract_specs_from_stitched_image(stitched_image)
                 else:
-                    image_specs = {}
+                    image_specs =  ""
             else:
-                image_specs = {}
+                image_specs = ""
 
-            img_spec_str = "，".join([f"{k}:{v}" for k, v in image_specs.items()])
-            full_document = f"{base_info} 技术图纸解析参数：{img_spec_str if img_spec_str else '无附加图纸参数'}。"
 
             try:
-                text_embedding = self._get_qwen_embedding(full_document)
-                self.text_collection.add(
-                    documents=[full_document],
+                # 只算基础信息的向量
+                text_embedding = self._get_qwen_embedding(searchable_base_info)
+
+                # 【修改标注 3】：改为 upsert 覆盖错误数据；把大模型提取的商详图片参数 image_specs 藏进 metadatas
+                self.text_collection.upsert(
+                    documents=[searchable_base_info],
                     embeddings=[text_embedding],
-                    metadatas=[{"product_id": product_id, "model": row['商品型号']}],
+                    metadatas=[{
+                        "product_id": product_id,
+                        "model": str(row['商品型号']),
+                        "price": str(row['当前实际销售价格']),
+                        "detailed_specs": image_specs if image_specs else '无附加图纸参数'
+                    }],
                     ids=[f"txt_{product_id}"]
                 )
-                print("✅ 文本知识特征入库成功")
+                print("✅ 文本基础特征与参数 Metadata 入库成功")
             except Exception as e:
                 print(f"❌ 文本特征入库失败: {e}")
 
@@ -248,9 +288,16 @@ class DualStreamAgentSystem:
         query_embedding = self._get_qwen_embedding(user_query)
         results = self.text_collection.query(query_embeddings=[query_embedding], n_results=3)
 
-        context = "知识库中暂未找到相关信息。"
+        context_parts = []
         if results['documents'] and results['documents'][0]:
-            context = "\n---\n".join(results['documents'][0])
+            for i in range(len(results['documents'][0])):
+                doc = results['documents'][0][i]  # 检索命中的基础信息
+                meta = results['metadatas'][0][i]  # 绑定的 Metadata 数据
+
+                part = f"【基础信息】{doc}\n【参考价格】{meta.get('price', '未知')}元\n【图纸与详细参数】\n{meta.get('detailed_specs', '无附加图纸参数')}"
+                context_parts.append(part)
+
+        context = "\n---\n".join(context_parts) if context_parts else "知识库中暂未找到相关信息。"
 
         # 2. 构造强大的 System Prompt (赋予其导购和结账能力)
         system_prompt = f"""
@@ -314,7 +361,7 @@ class DualStreamAgentSystem:
 if __name__ == "__main__":
     df = pd.read_excel('data/goods_batch_1_20260130_180359.xlsx').head(2)
 
-    agent_system = DualStreamAgentSystem(db_path="./agent_final_db")
+    agent_system = DualStreamAgentSystem(db_path="../../agent_final_db")
     agent_system.build_knowledge_base(df)
 
     print("\n============== 测试场景 2：基于长图解析的文字问答 ==============")
