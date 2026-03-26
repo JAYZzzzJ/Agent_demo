@@ -78,7 +78,7 @@ def train_model():
         print("⚠️ 警告：有效偏好数据少于 10 条，为了效果建议收集更多人工修正数据后再训练。")
 
     # 拆分训练集和验证集 (简单起见，这里假设数据够多)
-    # dataset = dataset.train_test_split(test_size=0.1)
+    # dataset = dataset.train_test_split(test_size=0.1)34
 
     # 设定 DPO 训练参数
     training_args = DPOConfig(
